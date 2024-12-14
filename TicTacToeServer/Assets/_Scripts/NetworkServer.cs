@@ -1,5 +1,4 @@
 using UnityEngine;
-using UnityEngine.Assertions;
 using Unity.Collections;
 using Unity.Networking.Transport;
 using System.Text;
@@ -16,6 +15,10 @@ public class NetworkServer : MonoBehaviour
 
     const int MaxNumberOfClientConnections = 1000;
 
+    private int[,] gameBoard = new int[3, 3]; // 0 = empty, 1 = Player 1, 2 = Player 2
+    private int currentPlayer = 1; // Player 1 starts
+    private bool gameActive = true;
+
     void Start()
     {
         networkDriver = NetworkDriver.Create();
@@ -26,11 +29,13 @@ public class NetworkServer : MonoBehaviour
 
         int error = networkDriver.Bind(endpoint);
         if (error != 0)
-            Debug.Log("Failed to bind to port " + NetworkPort);
+            UnityEngine.Debug.Log("Failed to bind to port " + NetworkPort);
         else
             networkDriver.Listen();
 
         networkConnections = new NativeList<NetworkConnection>(MaxNumberOfClientConnections, Allocator.Persistent);
+
+        ResetGame(); // Initialize the game state
     }
 
     void OnDestroy()
@@ -41,21 +46,7 @@ public class NetworkServer : MonoBehaviour
 
     void Update()
     {
-        #region Check Input and Send Msg
-
-        if (Input.GetKeyDown(KeyCode.A))
-        {
-            for (int i = 0; i < networkConnections.Length; i++)
-            {
-                SendMessageToClient("Hello client's world, sincerely your network server", networkConnections[i]);
-            }
-        }
-
-        #endregion
-
         networkDriver.ScheduleUpdate().Complete();
-
-        #region Remove Unused Connections
 
         for (int i = 0; i < networkConnections.Length; i++)
         {
@@ -66,18 +57,10 @@ public class NetworkServer : MonoBehaviour
             }
         }
 
-        #endregion
-
-        #region Accept New Connections
-
         while (AcceptIncomingConnection())
         {
-            Debug.Log("Accepted a client connection");
+            UnityEngine.Debug.Log("Accepted a client connection");
         }
-
-        #endregion
-
-        #region Manage Network Events
 
         DataStreamReader streamReader;
         NetworkPipeline pipelineUsedToSendEvent;
@@ -90,11 +73,6 @@ public class NetworkServer : MonoBehaviour
 
             while (PopNetworkEventAndCheckForData(networkConnections[i], out networkEventType, out streamReader, out pipelineUsedToSendEvent))
             {
-                if (pipelineUsedToSendEvent == reliableAndInOrderPipeline)
-                    Debug.Log("Network event from: reliableAndInOrderPipeline");
-                else if (pipelineUsedToSendEvent == nonReliableNotInOrderedPipeline)
-                    Debug.Log("Network event from: nonReliableNotInOrderedPipeline");
-
                 switch (networkEventType)
                 {
                     case NetworkEvent.Type.Data:
@@ -103,18 +81,16 @@ public class NetworkServer : MonoBehaviour
                         streamReader.ReadBytes(buffer);
                         byte[] byteBuffer = buffer.ToArray();
                         string msg = Encoding.Unicode.GetString(byteBuffer);
-                        ProcessReceivedMsg(msg);
+                        ProcessReceivedMsg(msg, networkConnections[i]);
                         buffer.Dispose();
                         break;
                     case NetworkEvent.Type.Disconnect:
-                        Debug.Log("Client has disconnected from server");
+                        UnityEngine.Debug.Log("Client has disconnected from server");
                         networkConnections[i] = default(NetworkConnection);
                         break;
                 }
             }
         }
-
-        #endregion
     }
 
     private bool AcceptIncomingConnection()
@@ -136,9 +112,21 @@ public class NetworkServer : MonoBehaviour
         return true;
     }
 
-    private void ProcessReceivedMsg(string msg)
+    private void ProcessReceivedMsg(string msg, NetworkConnection sender)
     {
-        Debug.Log("Msg received = " + msg);
+        UnityEngine.Debug.Log("Msg received = " + msg);
+
+        if (msg.StartsWith("MOVE"))
+        {
+            string[] parts = msg.Split('|');
+            if (parts.Length == 4)
+            {
+                int player = int.Parse(parts[1]);
+                int x = int.Parse(parts[2]);
+                int y = int.Parse(parts[3]);
+                ProcessGameMove(player, x, y);
+            }
+        }
     }
 
     public void SendMessageToClient(string msg, NetworkConnection networkConnection)
@@ -146,10 +134,7 @@ public class NetworkServer : MonoBehaviour
         byte[] msgAsByteArray = Encoding.Unicode.GetBytes(msg);
         NativeArray<byte> buffer = new NativeArray<byte>(msgAsByteArray, Allocator.Persistent);
 
-
-        //Driver.BeginSend(m_Connection, out var writer);
         DataStreamWriter streamWriter;
-        //networkConnection.
         networkDriver.BeginSend(reliableAndInOrderPipeline, networkConnection, out streamWriter);
         streamWriter.WriteInt(buffer.Length);
         streamWriter.WriteBytes(buffer);
@@ -158,4 +143,91 @@ public class NetworkServer : MonoBehaviour
         buffer.Dispose();
     }
 
+    public void SendToAllClients(string msg)
+    {
+        for (int i = 0; i < networkConnections.Length; i++)
+        {
+            if (networkConnections[i].IsCreated)
+            {
+                SendMessageToClient(msg, networkConnections[i]);
+            }
+        }
+    }
+
+    private void ResetGame()
+    {
+        for (int i = 0; i < 3; i++)
+            for (int j = 0; j < 3; j++)
+                gameBoard[i, j] = 0;
+
+        currentPlayer = 1;
+        gameActive = true;
+    }
+
+    private string SerializeGameState()
+    {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < 3; i++)
+        {
+            for (int j = 0; j < 3; j++)
+            {
+                sb.Append(gameBoard[i, j]);
+                if (j < 2) sb.Append(",");
+            }
+            if (i < 2) sb.Append(";");
+        }
+        sb.Append("|").Append(currentPlayer).Append("|").Append(gameActive);
+        return sb.ToString();
+    }
+
+    private void ProcessGameMove(int player, int x, int y)
+    {
+        if (!gameActive || gameBoard[x, y] != 0 || player != currentPlayer)
+            return;
+
+        gameBoard[x, y] = player;
+        if (CheckWinCondition(player))
+        {
+            gameActive = false;
+            SendToAllClients($"WIN|{player}");
+        }
+        else if (CheckDrawCondition())
+        {
+            gameActive = false;
+            SendToAllClients("DRAW");
+        }
+        else
+        {
+            currentPlayer = currentPlayer == 1 ? 2 : 1;
+        }
+
+        SendToAllClients(SerializeGameState());
+    }
+
+    private bool CheckWinCondition(int player)
+    {
+        for (int i = 0; i < 3; i++)
+            if (gameBoard[i, 0] == player && gameBoard[i, 1] == player && gameBoard[i, 2] == player)
+                return true;
+
+        for (int j = 0; j < 3; j++)
+            if (gameBoard[0, j] == player && gameBoard[1, j] == player && gameBoard[2, j] == player)
+                return true;
+
+        if (gameBoard[0, 0] == player && gameBoard[1, 1] == player && gameBoard[2, 2] == player)
+            return true;
+
+        if (gameBoard[0, 2] == player && gameBoard[1, 1] == player && gameBoard[2, 0] == player)
+            return true;
+
+        return false;
+    }
+
+    private bool CheckDrawCondition()
+    {
+        foreach (var cell in gameBoard)
+            if (cell == 0) return false;
+
+        return true;
+    }
 }
