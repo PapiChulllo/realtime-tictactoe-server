@@ -2,6 +2,7 @@ using UnityEngine;
 using Unity.Collections;
 using Unity.Networking.Transport;
 using System.Text;
+using System.Collections.Generic; // For Dictionary
 
 public class NetworkServer : MonoBehaviour
 {
@@ -12,12 +13,14 @@ public class NetworkServer : MonoBehaviour
     NetworkPipeline nonReliableNotInOrderedPipeline;
 
     const ushort NetworkPort = 9001;
-
     const int MaxNumberOfClientConnections = 1000;
 
     private int[,] gameBoard = new int[3, 3]; // 0 = empty, 1 = Player 1, 2 = Player 2
     private int currentPlayer = 1; // Player 1 starts
     private bool gameActive = true;
+
+    private Dictionary<NetworkConnection, int> playerNumbers = new Dictionary<NetworkConnection, int>();
+    private int nextPlayerNumber = 1; // Start with Player 1
 
     void Start()
     {
@@ -79,11 +82,11 @@ public class NetworkServer : MonoBehaviour
                         int sizeOfDataBuffer = streamReader.ReadInt();
                         NativeArray<byte> buffer = new NativeArray<byte>(sizeOfDataBuffer, Allocator.Persistent);
                         streamReader.ReadBytes(buffer);
-                        byte[] byteBuffer = buffer.ToArray();
-                        string msg = Encoding.Unicode.GetString(byteBuffer);
+                        string msg = Encoding.Unicode.GetString(buffer.ToArray());
                         ProcessReceivedMsg(msg, networkConnections[i]);
                         buffer.Dispose();
                         break;
+
                     case NetworkEvent.Type.Disconnect:
                         UnityEngine.Debug.Log("Client has disconnected from server");
                         networkConnections[i] = default(NetworkConnection);
@@ -100,6 +103,24 @@ public class NetworkServer : MonoBehaviour
             return false;
 
         networkConnections.Add(connection);
+
+        if (nextPlayerNumber <= 2)
+        {
+            playerNumbers[connection] = nextPlayerNumber;
+            UnityEngine.Debug.Log($"Assigned Player {nextPlayerNumber} to connection.");
+            SendMessageToClient($"PLAYER|{nextPlayerNumber}", connection);
+            nextPlayerNumber++;
+
+            // Send the initial game state to the new client
+            string gameState = SerializeGameState();
+            SendMessageToClient(gameState, connection);
+        }
+        else
+        {
+            UnityEngine.Debug.LogError("Game is full. Rejecting connection.");
+            connection.Close(networkDriver);
+        }
+
         return true;
     }
 
@@ -109,6 +130,7 @@ public class NetworkServer : MonoBehaviour
 
         if (networkEventType == NetworkEvent.Type.Empty)
             return false;
+
         return true;
     }
 
@@ -116,12 +138,12 @@ public class NetworkServer : MonoBehaviour
     {
         UnityEngine.Debug.Log("Msg received = " + msg);
 
-        if (msg.StartsWith("MOVE"))
+        if (msg.StartsWith("MOVE") && playerNumbers.ContainsKey(sender))
         {
             string[] parts = msg.Split('|');
             if (parts.Length == 4)
             {
-                int player = int.Parse(parts[1]);
+                int player = playerNumbers[sender]; // Get the player number from the connection
                 int x = int.Parse(parts[2]);
                 int y = int.Parse(parts[3]);
                 ProcessGameMove(player, x, y);
@@ -129,39 +151,34 @@ public class NetworkServer : MonoBehaviour
         }
     }
 
-    public void SendMessageToClient(string msg, NetworkConnection networkConnection)
+    private void ProcessGameMove(int player, int x, int y)
     {
-        byte[] msgAsByteArray = Encoding.Unicode.GetBytes(msg);
-        NativeArray<byte> buffer = new NativeArray<byte>(msgAsByteArray, Allocator.Persistent);
-
-        DataStreamWriter streamWriter;
-        networkDriver.BeginSend(reliableAndInOrderPipeline, networkConnection, out streamWriter);
-        streamWriter.WriteInt(buffer.Length);
-        streamWriter.WriteBytes(buffer);
-        networkDriver.EndSend(streamWriter);
-
-        buffer.Dispose();
-    }
-
-    public void SendToAllClients(string msg)
-    {
-        for (int i = 0; i < networkConnections.Length; i++)
+        if (!gameActive || gameBoard[x, y] != 0 || player != currentPlayer)
         {
-            if (networkConnections[i].IsCreated)
-            {
-                SendMessageToClient(msg, networkConnections[i]);
-            }
+            UnityEngine.Debug.Log($"Invalid move by Player {player} at ({x}, {y}).");
+            return;
         }
-    }
 
-    private void ResetGame()
-    {
-        for (int i = 0; i < 3; i++)
-            for (int j = 0; j < 3; j++)
-                gameBoard[i, j] = 0;
+        gameBoard[x, y] = player;
 
-        currentPlayer = 1;
-        gameActive = true;
+        if (CheckWinCondition(player))
+        {
+            gameActive = false;
+            SendToAllClients($"WIN|{player}");
+        }
+        else if (CheckDrawCondition())
+        {
+            gameActive = false;
+            SendToAllClients("DRAW");
+        }
+        else
+        {
+            currentPlayer = currentPlayer == 1 ? 2 : 1; // Switch turns
+        }
+
+        string gameState = SerializeGameState();
+        UnityEngine.Debug.Log($"Broadcasting game state: {gameState}");
+        SendToAllClients(gameState);
     }
 
     private string SerializeGameState()
@@ -178,30 +195,6 @@ public class NetworkServer : MonoBehaviour
         }
         sb.Append("|").Append(currentPlayer).Append("|").Append(gameActive);
         return sb.ToString();
-    }
-
-    private void ProcessGameMove(int player, int x, int y)
-    {
-        if (!gameActive || gameBoard[x, y] != 0 || player != currentPlayer)
-            return;
-
-        gameBoard[x, y] = player;
-        if (CheckWinCondition(player))
-        {
-            gameActive = false;
-            SendToAllClients($"WIN|{player}");
-        }
-        else if (CheckDrawCondition())
-        {
-            gameActive = false;
-            SendToAllClients("DRAW");
-        }
-        else
-        {
-            currentPlayer = currentPlayer == 1 ? 2 : 1;
-        }
-
-        SendToAllClients(SerializeGameState());
     }
 
     private bool CheckWinCondition(int player)
@@ -229,5 +222,37 @@ public class NetworkServer : MonoBehaviour
             if (cell == 0) return false;
 
         return true;
+    }
+
+    private void SendToAllClients(string msg)
+    {
+        foreach (var connection in playerNumbers.Keys)
+        {
+            SendMessageToClient(msg, connection);
+        }
+    }
+
+    public void SendMessageToClient(string msg, NetworkConnection connection)
+    {
+        byte[] msgAsByteArray = Encoding.Unicode.GetBytes(msg);
+        NativeArray<byte> buffer = new NativeArray<byte>(msgAsByteArray, Allocator.Persistent);
+
+        DataStreamWriter streamWriter;
+        networkDriver.BeginSend(reliableAndInOrderPipeline, connection, out streamWriter);
+        streamWriter.WriteInt(buffer.Length);
+        streamWriter.WriteBytes(buffer);
+        networkDriver.EndSend(streamWriter);
+
+        buffer.Dispose();
+    }
+
+    private void ResetGame()
+    {
+        for (int i = 0; i < 3; i++)
+            for (int j = 0; j < 3; j++)
+                gameBoard[i, j] = 0;
+
+        currentPlayer = 1;
+        gameActive = true;
     }
 }
