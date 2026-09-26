@@ -1,94 +1,69 @@
 # Realtime Tic-Tac-Toe Server
 
-Server-authoritative two-player tic-tac-toe built directly on Unity Transport. The server assigns player numbers, validates turns and occupied cells, owns the board, detects wins/draws, and broadcasts game state.
+**A server-authoritative two-player tic-tac-toe host built with Unity Transport.** It assigns Player 1 / Player 2 on connect, validates moves against turn and board state, checks win/draw, and broadcasts board + result messages to both clients.
 
-**Paired repository:** [Realtime Tic-Tac-Toe Client](https://github.com/PapiChulllo/realtime-tictactoe-client)
+**Paired repository:** [realtime-tictactoe-client](https://github.com/PapiChulllo/realtime-tictactoe-client)
 
-## Stack
+---
 
-- Unity `2022.3.46f1`
-- Unity Transport `2.4.0`
-- UDP port `9001`
-- Server bind: all IPv4 interfaces
-- Unity project: `TicTacToeServer/`
-- Scene: `TicTacToeServer/Assets/Scenes/SampleScene.unity`
+## How it works
 
-## Editor-only run order
+1. First accepted connection becomes Player 1; second becomes Player 2. Further connections are closed.
+2. On connect, the server sends `PLAYER|<n>` then the current board state (`rows|currentPlayer|gameActive`).
+3. Clients request `MOVE|<claimedPlayer>|<x>|<y>`; the server **ignores** the claimed player number and uses the connection’s assigned number.
+4. Valid empty-cell, on-turn moves update the board; win → `WIN|<player>`, full board → `DRAW`, then an updated state broadcast. Turns flip when the game continues.
 
-Both repositories have empty Build Settings scene lists, so this project is documented for Editor use only. No standalone build is verified.
+**Status / limitations:** educational prototype. Player slots are a **lifetime counter** — disconnects do not free numbers or reset the match. `ResetGame` runs at server start only; there is no rematch protocol. Parsing is not hardened against malformed input. No auth, TLS, lobby, spectators, or persistence. Build Settings scene list is empty (Editor-only run path). No automated tests; Unity unavailable for re-verification in this documentation pass.
 
-1. Open `TicTacToeServer/` in Unity Hub with Unity `2022.3.46f1`.
-2. Open `Assets/Scenes/SampleScene.unity` and enter Play mode. The server must start first and bind UDP `9001`.
-3. Open the paired client's `TicTacToeClient/` project in a separate Unity Editor and enter Play mode for Player 1.
-4. Open a second local checkout/copy of that client project in another Unity Editor and enter Play mode for Player 2.
-5. Click cells in the client Game views. The server permits moves only from the player whose turn it is.
+## Tech stack
 
-The client defaults to `127.0.0.1`. For LAN use, its `IPAddress` constant in `TicTacToeClient/Assets/_Scripts/NetworkClient.cs` must point to the server host, and UDP `9001` must be allowed through the firewall.
+| Area | What it uses |
+|---|---|
+| Engine | **Unity** `2022.3.46f1` (project under `TicTacToeServer/`) |
+| Networking | **Unity Transport** `2.4.0` |
+| Bind | UDP port **9001**, `NetworkEndpoint.AnyIpv4` |
+| Encoding | `Encoding.Unicode` + `int` length prefix; reliable sequenced pipeline |
+| Rules | In-process `int[3,3]` board (`0` empty, `1`/`2` players) |
 
-## Authoritative flow
+A fragmentation-only pipeline is also created but unused by gameplay.
 
-```mermaid
-sequenceDiagram
-    participant C1 as Client 1
-    participant S as Server
-    participant C2 as Client 2
+## What's in the project
 
-    C1->>S: Connect
-    S-->>C1: PLAYER|1
-    S-->>C1: board|currentPlayer|gameActive
-    C2->>S: Connect
-    S-->>C2: PLAYER|2
-    S-->>C2: board|currentPlayer|gameActive
-    C1->>S: MOVE|1|x|y
-    S->>S: Map connection to player and validate move
-    alt Winning move
-        S-->>C1: WIN|1
-        S-->>C2: WIN|1
-    else Draw
-        S-->>C1: DRAW
-        S-->>C2: DRAW
-    else Game continues
-        S->>S: Switch current player
-    end
-    S-->>C1: board|currentPlayer|gameActive
-    S-->>C2: board|currentPlayer|gameActive
-```
+| System | Key files |
+|---|---|
+| Transport lifecycle, player assignment, protocol, board rules, broadcasts | `TicTacToeServer/Assets/_Scripts/NetworkServer.cs` |
+| Server Editor scene | `TicTacToeServer/Assets/Scenes/SampleScene.unity` |
+| Packages / project settings | `TicTacToeServer/Packages/`, `TicTacToeServer/ProjectSettings/` |
 
-The server ignores the player number claimed inside `MOVE`; it uses the sending connection's assigned number. It accepts a move only while the game is active, on an empty cell, and on that player's turn, then broadcasts the resulting state.
+One authored gameplay script (~8.7 KB) owns networking and rules end-to-end.
 
-## Message protocol
+### Code / system highlights
 
-Every payload is `Encoding.Unicode` text prefixed by a transport `int` byte length and sent through `FragmentationPipelineStage` plus `ReliableSequencedPipelineStage`.
+- **Connection map:** `Dictionary<NetworkConnection, int> playerNumbers` with `nextPlayerNumber` capped at 2.
+- **Authoritative move path:** maps sender → player, rejects off-turn / occupied / inactive games, then win/draw checks and `SendToAllClients`.
+- **State payload:** three semicolon-separated rows of comma-separated cells, then current player and `gameActive` flag.
+
+### Message protocol
 
 | Direction | Payload | Purpose |
-| --- | --- | --- |
-| Server → client | `PLAYER|<1-or-2>` | Assigns the connection's player number. |
-| Server → client | `<r0>;<r1>;<r2>|<currentPlayer>|<gameActive>` | Sends three semicolon-separated rows, each containing three comma-separated cells (`0`, `1`, `2`), followed by the turn and active flag. |
-| Client → server | `MOVE|<claimedPlayer>|<x>|<y>` | Requests a cell; server trusts its connection map, not `claimedPlayer`. |
-| Server → clients | `WIN|<player>` | Announces a winning move. |
-| Server → clients | `DRAW` | Announces a full board without a winner. |
+|---|---|---|
+| Server → client | `PLAYER\|<1-or-2>` | Assign player number |
+| Server → client | `<r0>;<r1>;<r2>\|<currentPlayer>\|<gameActive>` | Board + turn + active flag |
+| Client → server | `MOVE\|<claimedPlayer>\|<x>\|<y>` | Move request (claimed player ignored) |
+| Server → clients | `WIN\|<player>` / `DRAW` | Terminal result announcements |
 
-The code also constructs a fragmentation-only pipeline, but gameplay never sends through it.
+## Scenes
 
-## Two-client cap and lifecycle
+| Scene | Purpose |
+|---|---|
+| `TicTacToeServer/Assets/Scenes/SampleScene.unity` | Open this Unity project folder and enter Play mode before clients connect |
 
-The first two accepted connections become Player 1 and Player 2. Later connections are closed. This is a lifetime counter, not a reusable lobby: disconnects do not remove entries from `playerNumbers`, decrement `nextPlayerNumber`, free a slot, or reset the match. `SendToAllClients` also retains disconnected connection keys.
+Editor Build Settings scene list is empty — treat as Editor-only for this README.
 
-There is no server rematch command. `ResetGame` runs only when the server starts; the similarly named client method changes local UI only and does not reset authoritative state.
+## Third-party assets
 
-## Repository map
+Unity packages only (Transport, TextMesh Pro, uGUI, etc.). No third-party game content packs.
 
-- `TicTacToeServer/Assets/_Scripts/NetworkServer.cs` — transport lifecycle, player assignment, protocol handling, board rules, and broadcasts.
-- `TicTacToeServer/Assets/Scenes/SampleScene.unity` — server Editor scene.
-- `TicTacToeServer/Packages/manifest.json` — package versions.
-- `TicTacToeServer/ProjectSettings/` — Unity project configuration; its build-scene list is empty.
+## About this repository
 
-## Limitations
-
-- Exactly two player numbers are available per server process; disconnected slots are not reclaimed.
-- There is no rematch flow, lobby, reconnect/state recovery, spectator mode, persistence, or configurable match.
-- Coordinates and message parsing are not hardened against malformed or out-of-range input.
-- There is no production authentication, authorization, TLS/encryption, matchmaking, rate limiting, or abuse protection.
-- There are no automated tests. Unity compilation, Play mode, and builds were not verified in this documentation pass because Unity was unavailable.
-
-See the [Realtime Tic-Tac-Toe Client](https://github.com/PapiChulllo/realtime-tictactoe-client) for the grid UI and move-request path.
+Public educational / portfolio showcase for a compact server-authoritative Unity Transport game under **PapiChulllo**. Pair with [realtime-tictactoe-client](https://github.com/PapiChulllo/realtime-tictactoe-client). Documentation mirrors committed source only.
